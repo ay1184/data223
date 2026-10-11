@@ -1,0 +1,1405 @@
+"""Regulatory junction and connector reconstruction in biochemical diagrams.
+
+Method
+  1. Image processing on each diagram (public images only): ink mask against the local background colour,
+     entity outlines from enclosed regions, tinted fills and dashed group enclosures, stroke width estimate.
+  2. Symbol candidates: enclosed round holes plus a ring filter (ring coverage, empty interior, 8 sectors).
+  3. Learned symbol model, trained inside this script: a small CNN (SymNet) classifies each candidate
+     crop as a regulatory catalysis terminal or not. Labels come only from the public training and
+     validation annotations (junction positions); 8-way dihedral augmentation and test-time averaging.
+     It runs on the GPU when one is available (torch.device line in main).
+  4. Connector tracing: skeleton graph of the remaining connector ink (spur pruning, crossing merge),
+     best-first search from the attachment junction to entity outlines (straightest continuation through
+     crossings, dashed-gap bridging), arrowhead blobs mark outputs, unheaded terminals are inputs.
+  5. Threshold for accepting symbols is selected inside the script from {0.5, 0.7, 0.85} on the separately
+     grouped validation diagrams after fitting on training diagrams; the final model is refit on all
+     labelled diagrams with that threshold.
+Data and models: only the supplied public files (images, train.csv, validation.csv, test.csv,
+diagrams.jsonl). No pretrained weights, no external data, no hosted APIs, no internet access.
+Test images are only read to predict their own row.
+
+Runtime (measured, this exact file, end to end incl. both CNN fits and the validation pass):
+  963 s (16.1 min) wall clock, measured on a 4-core CPU without any GPU while other jobs shared the CPU;
+  that is 18% of the 90-minute cap. The A10G run itself was not measured.
+"""
+import os, glob, csv, json, math, random
+from multiprocessing import Pool
+import numpy as np, pandas as pd, cv2
+from scipy import ndimage as ndi
+from scipy.optimize import linear_sum_assignment
+from skimage.morphology import skeletonize
+import torch, torch.nn as nn, torch.nn.functional as F
+
+SEED = 0
+EPOCHS = 15
+THRS = [0.5, 0.7, 0.85]
+N_PROC = max(1, min(8, os.cpu_count() or 1))
+
+
+# ===================================================================================== pipe
+
+INK_T = 215
+OFF8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+class Cand:
+    def __init__(self, cnt, kind):
+        self.cnt = cnt
+        x, y, w, h = cv2.boundingRect(cnt)
+        self.kind = kind
+        self.rect = (x, y, w, h)
+        self.box = [x - 0.5, y - 0.5, x + w - 0.5, y + h - 0.5]
+        self.area = cv2.contourArea(cnt)
+
+
+def detect_shapes(img):
+    H, W = img.shape[:2]
+    mn = img.min(axis=2)
+    bgc = np.stack([cv2.medianBlur(np.ascontiguousarray(img[:, :, k]), 41) for k in range(3)], 2)
+    diff = np.abs(img.astype(np.int16) - bgc.astype(np.int16)).max(axis=2)
+    ink = (((diff > 45) & (mn < 235)) | (mn < 110)).astype(np.uint8)
+    # holes: enclosed background regions
+    bg = 1 - ink
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bg, connectivity=4)
+    holes = []
+    circles = []
+    region = np.zeros((H, W), np.int32)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if w < 8 or h < 8:
+            continue
+        if x == 0 or y == 0 or x + w >= W or y + h >= H:
+            continue
+        if w * h > 0.4 * H * W:
+            continue
+        m = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c0 = max(cs, key=cv2.contourArea)
+        mf = np.zeros_like(m); cv2.drawContours(mf, [c0], -1, 1, thickness=-1)
+        c = c0 + np.array([x, y])
+        fa = float(mf.sum())
+        fill = fa / float(w * h)
+        if 6 <= w <= 72 and 6 <= h <= 72 and abs(w - h) <= max(2, 0.15 * max(w, h)) and 0.6 < fill < 0.86 and a > 0.85 * fa:
+            circles.append((x + (w - 1) / 2.0, y + (h - 1) / 2.0, (w + h) / 4.0))
+            continue
+        if w < 16 or h < 12:
+            continue
+        holes.append((c, fill, (x, y, w, h), fa - a))
+    cands = []
+    for c, fill, (x, y, w, h), inner in holes:
+        # grow contour by ~1.5px to the border centreline
+        cc = Cand(c, 'hole')
+        cc.inner = inner
+        cc.box = [x - 1.5, y - 1.5, x + w + 0.5, y + h + 0.5]
+        cc.fill = fill
+        cands.append(cc)
+    # tinted fills (complex enclosures, filled shapes)
+    tint = ((ink == 0) & (mn < 250)).astype(np.uint8)
+    tint = cv2.morphologyEx(tint, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats(tint, connectivity=8)
+    for i in range(1, n2):
+        x, y, w, h, a = st2[i]
+        if w < 20 or h < 14 or a < 150:
+            continue
+        if w * h > 0.4 * H * W:
+            continue
+        m = (lab2[y:y + h, x:x + w] == i).astype(np.uint8)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c0 = max(cs, key=cv2.contourArea)
+        mf = np.zeros_like(m); cv2.drawContours(mf, [c0], -1, 1, thickness=-1)
+        c = c0 + np.array([x, y])
+        cc = Cand(c, 'tint')
+        cc.inner = float((mf > 0)[ink[y:y + h, x:x + w] > 0].sum())
+        cc.box = [x - 1.0, y - 1.0, x + w, y + h]
+        cc.fill = float(mf.sum()) / float(w * h)
+        cands.append(cc)
+    # dashed / dotted enclosures: close short gaps along rows and columns, then look for new rectangular holes
+    L = 11
+    ch = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((1, L), np.uint8))
+    cvv = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((L, 1), np.uint8))
+    closed = (ink | ch | cvv).astype(np.uint8)
+    n3, lab3, st3, _ = cv2.connectedComponentsWithStats(1 - closed, connectivity=4)
+    for i in range(1, n3):
+        x, y, w, h, a = st3[i]
+        if w < 30 or h < 24 or x == 0 or y == 0 or x + w >= W or y + h >= H or w * h > 0.4 * H * W:
+            continue
+        m = (lab3[y:y + h, x:x + w] == i).astype(np.uint8)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c0 = max(cs, key=cv2.contourArea)
+        mf = np.zeros_like(m); cv2.drawContours(mf, [c0], -1, 1, thickness=-1)
+        c = c0 + np.array([x, y])
+        fa = float(mf.sum())
+        if fa / float(w * h) < 0.9:
+            continue
+        bx = [x - 1.5, y - 1.5, x + w + 0.5, y + h + 0.5]
+        dup = False
+        for o in cands:
+            ob = o.box
+            ix = max(0, min(ob[2], bx[2]) - max(ob[0], bx[0])); iy = max(0, min(ob[3], bx[3]) - max(ob[1], bx[1]))
+            u = (ob[2] - ob[0]) * (ob[3] - ob[1]) + (bx[2] - bx[0]) * (bx[3] - bx[1]) - ix * iy
+            if u > 0 and ix * iy / u > 0.85:
+                dup = True; break
+        if dup:
+            continue
+        cc = Cand(c, 'dash')
+        cc.box = bx
+        cc.fill = fa / float(w * h)
+        cc.inner = fa - a
+        cands.append(cc)
+    return ink, cands, circles
+
+
+def stroke_width(ink):
+    """most common perpendicular run length of ink (rows and columns)"""
+    hist = np.zeros(12)
+    for a in (ink, ink.T):
+        a = a.astype(np.int8)
+        d = np.diff(np.pad(a, ((0, 0), (1, 1))), axis=1)
+        st = np.nonzero(d == 1); en = np.nonzero(d == -1)
+        L = en[1] - st[1]
+        L = L[(L >= 1) & (L <= 11)]
+        hist += np.bincount(L, minlength=12)[:12]
+    hist[0] = 0
+    # weight runs by length so 1px antialias fringes do not dominate
+    m = int(np.argmax(hist * np.arange(12) ** 0.5))
+    return float(max(1.0, m))
+
+
+def entity_like(c, H, W):
+    x, y, w, h = c.rect
+    hull = cv2.convexHull(c.cnt)
+    ha = cv2.contourArea(hull)
+    sol = c.area / ha if ha > 0 else 0
+    c.solidity = sol
+    if c.kind == 'hole' and c.inner < max(12, 0.01 * c.area):
+        return False
+    return sol > 0.93 and c.fill > 0.7 and w < 0.6 * W and h < 0.6 * H
+
+
+def build_line_mask(ink, cands, H, W, sw):
+    ring = np.zeros((H, W), np.uint8)
+    fillm = np.zeros((H, W), np.uint8)
+    ents = [c for c in cands if entity_like(c, H, W)]
+    t = int(max(3, round(2 * sw + 2)))
+    for c in ents:
+        cv2.drawContours(ring, [c.cnt], -1, 1, thickness=t)
+    # leaf entities: remove interior (text)
+    for c in ents:
+        x0, y0, x1, y1 = c.box
+        leaf = True
+        for o in ents:
+            if o is c: continue
+            a0, b0, a1, b1 = o.box
+            if a0 >= x0 and b0 >= y0 and a1 <= x1 and b1 <= y1 and (a1 - a0) * (b1 - b0) < (x1 - x0) * (y1 - y0):
+                leaf = False; break
+        c.leaf = leaf
+        if leaf and (c.kind == 'hole' or c.rect[3] < 0.15 * H):
+            cv2.drawContours(fillm, [c.cnt], -1, 1, thickness=-1)
+    rm = ((ring > 0) | (fillm > 0)).astype(np.uint8)
+    lm = ink.copy()
+    lm[rm > 0] = 0
+    return lm, rm, ents
+
+
+def skel(lm):
+    return skeletonize(lm > 0).astype(np.uint8)
+
+
+def nearest_on(sk, p, rad=8, excl=None):
+    x0, y0 = int(round(p[0])), int(round(p[1]))
+    H, W = sk.shape
+    best = None; bd = 1e9
+    for y in range(max(0, y0 - rad), min(H, y0 + rad + 1)):
+        for x in range(max(0, x0 - rad), min(W, x0 + rad + 1)):
+            if sk[y, x]:
+                if excl is not None and excl(x, y):
+                    continue
+                d = (x - p[0]) ** 2 + (y - p[1]) ** 2
+                if d < bd:
+                    bd = d; best = (x, y)
+    return best
+
+
+def walk(sk, start, d0, visited_global=None, maxlen=6000, gap=12):
+    """walk along skeleton from start pixel in direction d0; returns list of (x,y)"""
+    H, W = sk.shape
+    path = [start]
+    vis = {start}
+    cur = start
+    d = np.array(d0, float); d /= (np.linalg.norm(d) + 1e-9)
+    for it in range(maxlen):
+        x, y = cur
+        nb = []
+        for dy, dx in OFF8:
+            xx, yy = x + dx, y + dy
+            if 0 <= xx < W and 0 <= yy < H and sk[yy, xx] and (xx, yy) not in vis:
+                nb.append((xx, yy))
+        if len(path) >= 6:
+            q = np.array(path[-6], float)
+            dd = np.array(cur, float) - q
+            nn = np.linalg.norm(dd)
+            if nn > 0:
+                d = 0.5 * d + 0.5 * dd / nn
+                d /= np.linalg.norm(d) + 1e-9
+        if not nb:
+            # gap jump (dashed lines / small breaks)
+            found = None
+            for t in range(2, gap + 1):
+                for s in (0, -1, 1, -2, 2):
+                    px = x + d[0] * t - d[1] * s * 0.5 * t / gap * 2
+                    py = y + d[1] * t + d[0] * s * 0.5 * t / gap * 2
+                    xi, yi = int(round(px)), int(round(py))
+                    if 0 <= xi < W and 0 <= yi < H and sk[yi, xi] and (xi, yi) not in vis:
+                        found = (xi, yi); break
+                if found: break
+            if not found:
+                break
+            nb = [found]
+        if len(nb) == 1:
+            nxt = nb[0]
+        else:
+            # choose straightest continuation, looking a few steps ahead
+            best = None; bs = -9
+            for c in nb:
+                v = np.array(c, float) - np.array(cur, float)
+                s = float(v @ d) / (np.linalg.norm(v) + 1e-9)
+                if s > bs:
+                    bs = s; best = c
+            nxt = best
+        # mark the other neighbours visited to avoid zig-zag
+        for c in nb:
+            vis.add(c)
+        path.append(nxt)
+        cur = nxt
+    return path
+
+
+def simplify(pts, eps=1.5):
+    a = np.array(pts, np.float32).reshape(-1, 1, 2)
+    s = cv2.approxPolyDP(a, eps, False).reshape(-1, 2)
+    return s.astype(float)
+
+
+def end_dir(path, k=10):
+    p = np.array(path, float)
+    a = p[-1]; b = p[max(0, len(p) - 1 - k)]
+    v = a - b; n = np.linalg.norm(v)
+    return v / n if n > 0 else np.array([1.0, 0.0])
+
+
+def find_entity(cands, p, d, maxd=10.0):
+    """entity whose outline is closest to end point p (moving in direction d)"""
+    best = None; bd = 1e9; bport = None
+    px, py = float(p[0]), float(p[1])
+    for c in cands:
+        x0, y0, x1, y1 = c.box
+        if px < x0 - maxd - 2 or px > x1 + maxd + 2 or py < y0 - maxd - 2 or py > y1 + maxd + 2:
+            continue
+        sd = cv2.pointPolygonTest(c.cnt, (px, py), True)  # >0 inside
+        ad = abs(sd)
+        if ad <= maxd and ad < bd:
+            bd = ad; best = c
+    if best is None:
+        return None, None
+    # port: march along d until reaching the outline (or back if inside)
+    port = np.array([px, py])
+    sd = cv2.pointPolygonTest(best.cnt, (px, py), True)
+    if sd < 0:
+        for t in np.arange(0, 14, 0.5):
+            q = (px + d[0] * t, py + d[1] * t)
+            if cv2.pointPolygonTest(best.cnt, q, True) >= -1.0:
+                port = np.array(q); break
+    return best, port
+
+
+def arrow_width(ink, path, back=(3, 16)):
+    """max perpendicular ink width near the end of a path"""
+    p = np.array(path, float)
+    if len(p) < 4:
+        return 0
+    d = end_dir(path, 8); nrm = np.array([-d[1], d[0]])
+    e = p[-1]
+    H, W = ink.shape
+    best = 0
+    for t in range(back[0], back[1]):
+        c = e - d * t
+        cnt = 0
+        run = 0; mx = 0
+        for s in np.arange(-10, 10.5, 1.0):
+            q = c + nrm * s
+            xi, yi = int(round(q[0])), int(round(q[1]))
+            if 0 <= xi < W and 0 <= yi < H and ink[yi, xi]:
+                run += 1; mx = max(mx, run)
+            else:
+                run = 0
+        best = max(best, mx)
+    return best
+
+
+def arrow_width_fwd(ink, e, d, rng=(-4, 18)):
+    """perpendicular ink width around end point e looking forward along d (the arrowhead may lie beyond the skeleton end)"""
+    nrm = np.array([-d[1], d[0]])
+    H, W = ink.shape
+    ws = []
+    for t in range(rng[0], rng[1]):
+        c = e + d * t
+        run = 0; mx = 0
+        for s in np.arange(-10, 10.5, 1.0):
+            q = c + nrm * s
+            xi, yi = int(round(q[0])), int(round(q[1]))
+            if 0 <= xi < W and 0 <= yi < H and ink[yi, xi]:
+                run += 1; mx = max(mx, run)
+            else:
+                run = 0
+        ws.append(mx)
+    return ws
+
+
+def circle_ctrl_dir(ink, cx, cy, R):
+    H, W = ink.shape
+    best = None; bs = -1
+    for k in range(120):
+        th = 2 * math.pi * k / 120
+        u = (math.cos(th), math.sin(th))
+        s = 0
+        for rr in range(int(R + 3), int(R + 13)):
+            xi, yi = int(round(cx + u[0] * rr)), int(round(cy + u[1] * rr))
+            if 0 <= xi < W and 0 <= yi < H and ink[yi, xi]:
+                s += 1
+        if s > bs:
+            bs = s; best = th
+    return np.array([math.cos(best), math.sin(best)]), bs
+
+
+DBG = []
+ARMDBG = []
+def predict_image(img):
+    DBG.clear(); ARMDBG.clear()
+    H, W = img.shape[:2]
+    ink, cands, circles = detect_shapes(img)
+    sw = stroke_width(ink)
+    lm, rm, ents = build_line_mask(ink, cands, H, W, sw)
+    cands = ents
+    sk = skel(lm)
+    out = []
+    keep = []
+    for (cx, cy, rin) in circles:
+        inside = False
+        for c in cands:
+            if getattr(c, 'leaf', False) and c.box[0] < cx < c.box[2] and c.box[1] < cy < c.box[3]:
+                if cv2.pointPolygonTest(c.cnt, (float(cx), float(cy)), True) > 0:
+                    inside = True; break
+        if not inside:
+            keep.append((cx, cy, rin))
+    circles = keep
+    for (cx, cy, rin) in circles:
+        R = rin + sw  # outer radius
+        u_c, sc = circle_ctrl_dir(ink, cx, cy, R)
+        if sc < 6:
+            DBG.append(((cx, cy), 'weak_ctrl')); continue
+        u = -u_c  # from control side through centre to junction
+        J0 = np.array([cx, cy]) + u * (R + 0.5 * sw)
+        excl = lambda x, y: (x - cx) ** 2 + (y - cy) ** 2 < (R - 0.5) ** 2
+        # control trace
+        st = nearest_on(sk, (cx + u_c[0] * (R + 4), cy + u_c[1] * (R + 4)), rad=4)
+        if st is None:
+            DBG.append(((cx, cy), 'no_ctrl_start')); continue
+        cpath = walk(sk, st, u_c)
+        cend = np.array(cpath[-1], float)
+        ctrl, cport = find_entity(cands, cend, end_dir(cpath))
+        if ctrl is None:
+            DBG.append(((cx, cy), 'no_ctrl_entity', cend.tolist())); continue
+        # junction snapped to reaction line skeleton
+        Rex = rin + 0.6 * sw
+        js = nearest_on(sk, J0, rad=6, excl=lambda x, y: (x - cx) ** 2 + (y - cy) ** 2 < Rex ** 2)
+        if js is None:
+            DBG.append(((cx, cy), 'no_js')); continue
+        J = np.array(js, float)
+        # arms: skeleton pixels on rings around J, outside the symbol disc
+        pts = []
+        for rad in (4, 7, 10, 14):
+            for k in range(144):
+                th = 2 * math.pi * k / 144
+                q = J + rad * np.array([math.cos(th), math.sin(th)])
+                xi, yi = int(round(q[0])), int(round(q[1]))
+                if not (0 <= xi < W and 0 <= yi < H):
+                    continue
+                if (xi - cx) ** 2 + (yi - cy) ** 2 < Rex ** 2:
+                    continue
+                if sk[yi, xi] or (rad > 4 and sk[max(0, yi - 1):yi + 2, max(0, xi - 1):xi + 2].any()):
+                    pts.append((th, rad, xi, yi))
+        groups = []
+        for th, rad, xi, yi in sorted(pts):
+            for g in groups:
+                dth = abs((th - g['th'] + math.pi) % (2 * math.pi) - math.pi)
+                if dth < 0.45:
+                    g['m'].append((th, rad, xi, yi)); break
+            else:
+                groups.append({'th': th, 'm': [(th, rad, xi, yi)]})
+        inputs = []; outputs = []
+        used = set()
+        for g in groups:
+            m = sorted(g['m'], key=lambda t: t[1])
+            far = m[-1]
+            s0 = (far[2], far[3])
+            if not sk[s0[1], s0[0]]:
+                s0 = nearest_on(sk, (far[2], far[3]), rad=1)
+                if s0 is None:
+                    continue
+            d = np.array(s0, float) - J; d /= np.linalg.norm(d) + 1e-9
+            p = walk(sk, s0, d)
+            p = [tuple(J.astype(int))] + p
+            e = np.array(p[-1], float); de = end_dir(p)
+            ent, port = find_entity(cands, e, de)
+            ARMDBG.append(((cx, cy), J.tolist(), round(math.degrees(math.atan2(d[1], d[0]))), len(p), e.tolist(), None if ent is None else [round(v) for v in ent.box], ent is ctrl if ent is not None else None))
+            if ent is None or ent is ctrl or id(ent) in used:
+                continue
+            used.add(id(ent))
+            ws = arrow_width_fwd(lm, e, de, (-int(6 * sw + 6), 3))
+            head = max(ws) >= max(5, 2.6 * sw)
+            ARMDBG.append(('ws', max(ws), head))
+            poly = simplify([tuple(J)] + [tuple(q) for q in p[1:]] + [tuple(port)])
+            poly[0] = J; poly[-1] = port
+            if head:
+                outputs.append({'box': [float(v) for v in ent.box], 'path': [[float(a), float(b)] for a, b in poly]})
+            else:
+                poly = poly[::-1]
+                inputs.append({'box': [float(v) for v in ent.box], 'path': [[float(a), float(b)] for a, b in poly]})
+        if not outputs:
+            DBG.append(((cx, cy), 'no_outputs', len(groups), len(inputs))); continue
+        cp = [tuple(cport)] + [tuple(q) for q in cpath[::-1]] + [tuple(J)]
+        cpoly = simplify(cp)
+        cpoly[0] = cport; cpoly[-1] = J
+        out.append({'controller': [float(v) for v in ctrl.box], 'control': 'catalysis', 'junction': [float(J[0]), float(J[1])],
+                    'control_path': [[float(a), float(b)] for a, b in cpoly], 'inputs': inputs, 'outputs': outputs})
+    return out
+
+
+# ===================================================================================== graph
+
+OFF8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+class SkelGraph:
+    """skeleton -> nodes (clusters of non-degree-2 pixels) and edges (pixel chains)"""
+
+    def __init__(self, sk, spur=6, merge=5):
+        self.H, self.W = sk.shape
+        self.sk = sk.astype(np.uint8).copy()
+        self._build()
+        for _ in range(3):
+            if not self._prune(spur):
+                break
+            self._build()
+        self._merge(merge)
+
+    def _build(self):
+        sk = self.sk
+        k = np.ones((3, 3), np.uint8); k[1, 1] = 0
+        deg = cv2.filter2D(sk, cv2.CV_16S, k, borderType=cv2.BORDER_CONSTANT) * sk
+        nodepx = (sk > 0) & (deg != 2)
+        lab, n = ndi.label(nodepx, structure=np.ones((3, 3)))
+        self.nodelab = lab
+        self.nn = n
+        ys, xs = np.nonzero(nodepx)
+        self.node_pix = [[] for _ in range(n + 1)]
+        for y, x in zip(ys, xs):
+            self.node_pix[lab[y, x]].append((x, y))
+        self.node_pos = [None] + [np.mean(np.array(p, float), 0) for p in self.node_pix[1:]]
+        # edges
+        H, W = self.H, self.W
+        visited = np.zeros_like(sk, bool)
+        edges = []
+        adj = [[] for _ in range(n + 1)]
+        for nid in range(1, n + 1):
+            for (x, y) in self.node_pix[nid]:
+                for dy, dx in OFF8:
+                    xx, yy = x + dx, y + dy
+                    if not (0 <= xx < W and 0 <= yy < H) or not sk[yy, xx]:
+                        continue
+                    if lab[yy, xx]:
+                        continue  # node-node adjacency handled below
+                    if visited[yy, xx]:
+                        continue
+                    chain = [(x, y), (xx, yy)]
+                    visited[yy, xx] = True
+                    px, py = xx, yy
+                    prev = (x, y)
+                    end = None
+                    while True:
+                        nxt = None
+                        for ddy, ddx in OFF8:
+                            ax, ay = px + ddx, py + ddy
+                            if not (0 <= ax < W and 0 <= ay < H) or not sk[ay, ax]:
+                                continue
+                            if (ax, ay) == prev or (ax, ay) in chain[-3:]:
+                                continue
+                            if lab[ay, ax]:
+                                if lab[ay, ax] != nid or len(chain) > 3:
+                                    end = lab[ay, ax]; nxt = (ax, ay)
+                                    break
+                                continue
+                            if not visited[ay, ax]:
+                                nxt = (ax, ay)
+                                break
+                        if nxt is None:
+                            break
+                        chain.append(nxt)
+                        if end is not None:
+                            break
+                        visited[nxt[1], nxt[0]] = True
+                        prev = (px, py)
+                        px, py = nxt
+                    if end is None:
+                        continue
+                    eid = len(edges)
+                    edges.append({'a': nid, 'b': end, 'pix': chain})
+                    adj[nid].append((eid, 0))
+                    if end != nid:
+                        adj[end].append((eid, 1))
+                    else:
+                        adj[end].append((eid, 1))
+        self.edges = edges
+        self.adj = adj
+        # free loops (no node) are ignored
+
+    def _prune(self, spur):
+        changed = False
+        for e in self.edges:
+            a, b = e['a'], e['b']
+            da, db = len(self.adj[a]), len(self.adj[b])
+            L = len(e['pix'])
+            if L < spur and ((da == 1 and db >= 3) or (db == 1 and da >= 3)):
+                tip = a if da == 1 else b
+                for (x, y) in e['pix']:
+                    if self.nodelab[y, x] in (0, tip):
+                        self.sk[y, x] = 0
+                changed = True
+        return changed
+
+    def _merge(self, merge):
+        # union nodes connected by very short edges
+        par = list(range(self.nn + 1))
+
+        def f(i):
+            while par[i] != i:
+                par[i] = par[par[i]]; i = par[i]
+            return i
+        for e in self.edges:
+            if len(e['pix']) <= merge and e['a'] != e['b']:
+                par[f(e['a'])] = f(e['b'])
+        self.root = [f(i) for i in range(self.nn + 1)]
+        groups = {}
+        for i in range(1, self.nn + 1):
+            groups.setdefault(self.root[i], []).append(i)
+        self.mnode_pos = {}
+        for r, mem in groups.items():
+            pts = np.concatenate([np.array(self.node_pix[m], float) for m in mem], 0)
+            self.mnode_pos[r] = pts.mean(0)
+        self.madj = {r: [] for r in groups}
+        for eid, e in enumerate(self.edges):
+            ra, rb = self.root[e['a']], self.root[e['b']]
+            if ra == rb and len(e['pix']) <= merge:
+                continue
+            self.madj[ra].append((eid, 0))
+            self.madj[rb].append((eid, 1))
+        # pixel -> edge index map
+        self.pix_edge = -np.ones((self.H, self.W), np.int32)
+        self.pix_idx = np.zeros((self.H, self.W), np.int32)
+        for eid, e in enumerate(self.edges):
+            for k, (x, y) in enumerate(e['pix']):
+                if self.nodelab[y, x] == 0:
+                    self.pix_edge[y, x] = eid; self.pix_idx[y, x] = k
+
+    def edge_pts(self, eid, from_side):
+        p = self.edges[eid]['pix']
+        return p if from_side == 0 else p[::-1]
+
+    def tangent(self, pts, k=10):
+        """direction leaving pts[0] along the chain"""
+        p = np.array(pts, float)
+        j = min(len(p) - 1, k)
+        v = p[j] - p[0]
+        n = np.linalg.norm(v)
+        return v / n if n > 0 else np.array([1.0, 0.0])
+
+    def node_of(self, eid, side):
+        e = self.edges[eid]
+        return self.root[e['a'] if side == 0 else e['b']]
+
+
+def turn(d_in, d_out):
+    c = float(np.clip(d_in @ d_out, -1, 1))
+    return math.degrees(math.acos(c))
+
+
+# ===================================================================================== rings
+
+
+def ring_kernel(r, w):
+    s = int(math.ceil(r + w + 1))
+    yy, xx = np.mgrid[-s:s + 1, -s:s + 1]
+    d = np.hypot(xx, yy)
+    k = (np.abs(d - r) <= w / 2.0).astype(np.float32)
+    return k / k.sum()
+
+
+def disk_kernel(r):
+    s = int(math.ceil(r + 1))
+    yy, xx = np.mgrid[-s:s + 1, -s:s + 1]
+    k = (np.hypot(xx, yy) <= r).astype(np.float32)
+    return k / max(1.0, k.sum())
+
+
+def detect_rings(ink, sw, rmin=4.0, rmax=30.0, cov_t=0.72, int_t=0.33, sec_t=0.45):
+    """ring-shaped symbols: centre line radius r; returns list of (cx, cy, rin, score)"""
+    H, W = ink.shape
+    f = ink.astype(np.float32)
+    found = []
+    rr = rmin
+    w = max(1.5, 0.8 * sw)
+    while rr <= rmax:
+        cov = cv2.filter2D(f, -1, ring_kernel(rr, w), borderType=cv2.BORDER_CONSTANT)
+        ri = rr - 0.5 * sw - 1.5
+        if ri < 1.5:
+            rr += 1.0; continue
+        inn = cv2.filter2D(f, -1, disk_kernel(ri), borderType=cv2.BORDER_CONSTANT)
+        sc = cov - 0.8 * inn
+        mx = cv2.dilate(sc, np.ones((5, 5), np.uint8))
+        cand = (sc >= mx - 1e-6) & (cov >= cov_t) & (inn <= int_t)
+        ys, xs = np.nonzero(cand)
+        for x, y in zip(xs, ys):
+            # sector check
+            ok = True; secs = []
+            for s in range(8):
+                hit = 0; tot = 0
+                for a in np.linspace(2 * math.pi * s / 8, 2 * math.pi * (s + 1) / 8, 7, endpoint=False):
+                    px = int(round(x + rr * math.cos(a))); py = int(round(y + rr * math.sin(a)))
+                    tot += 1
+                    if 0 <= px < W and 0 <= py < H and ink[max(0, py - 1):py + 2, max(0, px - 1):px + 2].any():
+                        hit += 1
+                secs.append(hit / tot)
+            if min(secs) < sec_t:
+                continue
+            found.append((float(x), float(y), rr - 0.5 * sw, float(sc[y, x]), rr))
+        rr += 1.0
+    # nms
+    found.sort(key=lambda t: -t[3])
+    keep = []
+    for f_ in found:
+        if all(math.hypot(f_[0] - k[0], f_[1] - k[1]) > 0.8 * max(f_[4], k[4]) for k in keep):
+            keep.append(f_)
+    return keep
+
+
+# ===================================================================================== pipe3
+USE_RINGS = False
+
+DBG = []
+
+
+def find_entity2(cands, p, d, maxd, exclude=()):
+    best = None; bd = 1e9
+    px, py = float(p[0]), float(p[1])
+    for c in cands:
+        if id(c) in exclude:
+            continue
+        x0, y0, x1, y1 = c.box
+        if px < x0 - maxd - 2 or px > x1 + maxd + 2 or py < y0 - maxd - 2 or py > y1 + maxd + 2:
+            continue
+        sd = cv2.pointPolygonTest(c.cnt, (px, py), True)
+        ad = abs(sd) if sd < 0 else (0.0 if sd < 4 else sd)
+        # prefer the innermost outline when inside (members of complexes) only if close to its border
+        if ad <= maxd and ad < bd - 1e-6:
+            bd = ad; best = c
+    if best is None:
+        return None, None
+    port = np.array([px, py])
+    sd = cv2.pointPolygonTest(best.cnt, (px, py), True)
+    if sd < -1.0:
+        for t in np.arange(0, maxd + 2, 0.5):
+            q = (px + d[0] * t, py + d[1] * t)
+            if cv2.pointPolygonTest(best.cnt, q, True) >= -1.5:
+                port = np.array(q); break
+    return best, port
+
+
+class Ctx:
+    pass
+
+
+def prep_base(img):
+    H, W = img.shape[:2]
+    ink, cands, hole_circles = detect_shapes(img)
+    sw = stroke_width(ink)
+    lm, rm, ents = build_line_mask(ink, cands, H, W, sw)
+    sw = stroke_width(lm)
+    B = Ctx()
+    B.H, B.W, B.img, B.ink, B.ents, B.sw, B.lm, B.hole_circles = H, W, img, ink, ents, sw, lm, hole_circles
+    return B
+
+
+def _inside_leaf(B, cx, cy):
+    for c in B.ents:
+        if getattr(c, 'leaf', False) and c.box[0] < cx < c.box[2] and c.box[1] < cy < c.box[3]:
+            if cv2.pointPolygonTest(c.cnt, (float(cx), float(cy)), True) > 0:
+                return True
+    return False
+
+
+CROP = 40
+
+
+def circle_candidates(B, use_rings=True):
+    """ring-shaped symbol candidates (centre x, y, inner radius) and normalised crops"""
+    sw = B.sw
+    cl = [(x, y, rin) for (x, y, rin) in B.hole_circles]
+    if use_rings:
+        for (x, y, rin, sc_, rr) in detect_rings(B.ink, sw):
+            if all(math.hypot(x - a, y - b_) > 0.6 * (rin + r2) for (a, b_, r2) in cl):
+                cl.append((x, y, rin))
+    cl = [c for c in cl if not _inside_leaf(B, c[0], c[1])]
+    gray = cv2.cvtColor(B.img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    inkf = B.ink.astype(np.float32)
+    crops = np.zeros((len(cl), 2, CROP, CROP), np.float32)
+    for i, (x, y, rin) in enumerate(cl):
+        half = 2.0 * (rin + sw) + 2
+        sc = CROP / (2 * half)
+        M = np.array([[sc, 0, CROP / 2.0 - sc * x], [0, sc, CROP / 2.0 - sc * y]], np.float32)
+        crops[i, 0] = cv2.warpAffine(inkf, M, (CROP, CROP), flags=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR, borderValue=0)
+        crops[i, 1] = 1.0 - cv2.warpAffine(gray, M, (CROP, CROP), flags=cv2.INTER_LINEAR, borderValue=1.0)
+    return cl, crops
+
+
+def prep_finish(B, circles):
+    H, W, ink, sw, lm = B.H, B.W, B.ink, B.sw, B.lm
+    syms = []
+    yy, xx = np.mgrid[0:H, 0:W]
+    lm2 = lm.copy()
+    for (cx, cy, rin) in circles:
+        R = rin + sw
+        u_c, sc = circle_ctrl_dir(ink, cx, cy, R)
+        if sc < 5:
+            continue
+        u = -u_c
+        J0 = np.array([cx, cy]) + u * (rin + 1.5 * sw)
+        r0 = int(R + 3)
+        x0, x1 = max(0, int(cx) - r0), min(W, int(cx) + r0 + 1)
+        y0, y1 = max(0, int(cy) - r0), min(H, int(cy) + r0 + 1)
+        dd = np.hypot(xx[y0:y1, x0:x1] - cx, yy[y0:y1, x0:x1] - cy)
+        dj = np.hypot(xx[y0:y1, x0:x1] - J0[0], yy[y0:y1, x0:x1] - J0[1])
+        band = (dd <= rin + sw + 0.5) & (dj > sw + 2)
+        lm2[y0:y1, x0:x1][band] = 0
+        syms.append({'type': 'catalysis', 'c': np.array([cx, cy]), 'rin': rin, 'R': R, 'u': u, 'J0': J0})
+    ks = 2 * int(round(sw)) + 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+    core = cv2.morphologyEx(lm2, cv2.MORPH_OPEN, ker)
+    blob = cv2.dilate(core, ker) & lm2
+    nb, blab, bst, bcen = cv2.connectedComponentsWithStats(blob, connectivity=8)
+    heads = np.zeros_like(lm2)
+    good = [i for i in range(1, nb) if bst[i, 4] >= max(12, 2.0 * sw * sw) and max(bst[i, 2], bst[i, 3]) <= 12 * sw + 20]
+    for i in good:
+        heads[blab == i] = 1
+    lm3 = lm2.copy()
+    lm3[cv2.dilate(heads, np.ones((3, 3), np.uint8)) > 0] = 0
+    sk = skeletonize(lm3 > 0).astype(np.uint8)
+    G = SkelGraph(sk, spur=int(2 * sw + 5), merge=int(sw + 3))
+    C = Ctx()
+    C.H, C.W, C.ink, C.ents, C.sw, C.lm, C.lm3, C.heads, C.blab, C.sk, C.G, C.syms = H, W, ink, B.ents, sw, lm, lm3, heads, blab, G.sk, G, syms
+    return C
+
+
+def prep(img):
+    B = prep_base(img)
+    cl = [c for c in B.hole_circles if not _inside_leaf(B, c[0], c[1])]
+    return prep_finish(B, cl)
+
+
+def walk_graph(C, eid, k, direction, maxsteps=40):
+    """walk from pixel index k of edge eid; direction +1 towards end 'b', -1 towards 'a'.
+    returns pixel list and end descriptor"""
+    G = C.G
+    pix = G.edges[eid]['pix']
+    path = list(pix[k::direction]) if direction == 1 else list(pix[k::-1])
+    used = {eid}
+    side_arrive = 1 if direction == 1 else 0  # node at which we arrive: b if +1
+    for _ in range(maxsteps):
+        node = G.node_of(eid, side_arrive)
+        p = np.array(path, float)
+        j = max(0, len(p) - 11)
+        din = p[-1] - p[j]
+        n = np.linalg.norm(din)
+        din = din / n if n > 0 else np.array([1.0, 0.0])
+        cands = []
+        for (e2, s2) in G.madj[node]:
+            if e2 == eid and s2 == side_arrive:
+                continue
+            if e2 in used:
+                continue
+            pts = G.edge_pts(e2, s2)
+            t = G.tangent(pts, 10)
+            cands.append((turn(din, t), e2, s2, pts))
+        if not cands:
+            return path, ('end', G.mnode_pos[node], din)
+        cands.sort(key=lambda c: c[0])
+        if len(cands) == 1 or cands[0][0] < 50:
+            if len(cands) > 1 and cands[0][0] >= 50:
+                return path, ('tee', G.mnode_pos[node], din)
+            a, e2, s2, pts = cands[0]
+            if a > 100 and len(cands) == 1:
+                return path, ('end', G.mnode_pos[node], din)
+            path.extend(pts[1:])
+            used.add(e2)
+            eid = e2
+            side_arrive = 1 - s2
+            continue
+        return path, ('tee', G.mnode_pos[node], din)
+    return path, ('end', np.array(path[-1], float), din)
+
+
+def _jump(C, e, din):
+    """dashed / broken connector: next skeleton pixel ahead in a narrow cone"""
+    G = C.G
+    L = int(4 * C.sw + 12)
+    for t in range(2, L):
+        for sgn in (0, 1, -1, 2, -2):
+            off = sgn * 0.18 * t
+            q = e + din * t + np.array([-din[1], din[0]]) * off
+            x, y = int(round(q[0])), int(round(q[1]))
+            if 0 <= x < C.W and 0 <= y < C.H and G.pix_edge[y, x] >= 0:
+                return G.pix_edge[y, x], G.pix_idx[y, x], (x, y)
+    return None
+
+
+def trace_search(C, eid, k, direction, exclude=(), max_exp=300, want_head=None):
+    """best-first search over the skeleton graph from (eid,k,direction); returns list of
+    (cost, path, ent, port, head) for branches ending at an entity"""
+    G = C.G
+    import heapq
+    pix = G.edges[eid]['pix']
+    path0 = list(pix[k:]) if direction == 1 else list(pix[k::-1])
+    heap = [(0.0, 0, path0, eid, 1 if direction == 1 else 0, frozenset([eid]), 0)]
+    res = []
+    cnt = 0; uid = 1
+    while heap and cnt < max_exp:
+        cost, _, path, e, side_arr, used, jumps = heapq.heappop(heap)
+        cnt += 1
+        node = G.node_of(e, side_arr)
+        p = np.array(path, float)
+        j = max(0, len(p) - 11)
+        din = p[-1] - p[j]; n = np.linalg.norm(din)
+        din = din / n if n > 0 else np.array([1.0, 0.0])
+        nxt = []
+        for (e2, s2) in G.madj[node]:
+            if e2 == e and s2 == side_arr: continue
+            if e2 in used: continue
+            pts = G.edge_pts(e2, s2)
+            nxt.append((turn(din, G.tangent(pts, 10)), e2, s2, pts))
+        # terminal check at this node
+        ent, port, head = resolve_end(C, path, din, exclude=exclude)
+        if ent is not None and (not nxt or min(a for a, *_ in nxt) > 30):
+            res.append((cost, path, ent, port, head))
+            continue
+        if not nxt:
+            jp = _jump(C, p[-1], din) if jumps < 30 else None
+            if jp is not None:
+                e2, k2, q = jp
+                pix2 = G.edges[e2]['pix']
+                # continue away from the gap
+                a = np.array(pix2[max(0, k2 - 3)], float); b = np.array(pix2[min(len(pix2) - 1, k2 + 3)], float)
+                dn = 1 if (b - a) @ din >= 0 else -1
+                p2 = list(pix2[k2:]) if dn == 1 else list(pix2[k2::-1])
+                heapq.heappush(heap, (cost + 0.3, uid, path + p2, e2, 1 if dn == 1 else 0, used | {e2}, jumps + 1)); uid += 1
+            continue
+        for a, e2, s2, pts in nxt:
+            if a > 110: continue
+            c2 = cost + (a / 90.0) ** 2 + (0.15 if len(nxt) > 1 else 0)
+            heapq.heappush(heap, (c2, uid, path + list(pts[1:]), e2, 1 - s2, used | {e2}, jumps)); uid += 1
+    res.sort(key=lambda r: r[0])
+    return res
+
+
+def resolve_end(C, path, din, exclude=()):
+    """at the end of a traced connector: arrowhead? which entity? port"""
+    e = np.array(path[-1], float)
+    sw = C.sw
+    # arrowhead blob near the end
+    r = int(2 * sw + 4)
+    x0, x1 = max(0, int(e[0]) - r), min(C.W, int(e[0]) + r + 1)
+    y0, y1 = max(0, int(e[1]) - r), min(C.H, int(e[1]) + r + 1)
+    win = C.blab[y0:y1, x0:x1] * C.heads[y0:y1, x0:x1]
+    head = False
+    tip = e
+    if win.any():
+        ids, cnt = np.unique(win[win > 0], return_counts=True)
+        bid = ids[np.argmax(cnt)]
+        ys, xs = np.nonzero(C.blab == bid)
+        dist = np.hypot(xs - e[0], ys - e[1])
+        if dist.max() > sw:
+            head = True
+            j = np.argmax(dist)
+            tip = np.array([xs[j], ys[j]], float)
+            v = tip - e; nv = np.linalg.norm(v)
+            if nv > 0: din = v / nv
+    ent, port = find_entity2(C.ents, tip, din, maxd=(6 + 2 * sw) if head else (5 + 2 * sw), exclude=exclude)
+    return ent, port, head
+
+
+def poly(pts, eps=1.5):
+    s = simplify([tuple(map(float, q)) for q in pts], eps)
+    return s
+
+
+def predict_image(img, C=None):
+    DBG.clear()
+    if C is None:
+        C = prep(img)
+    G = C.G
+    out = []
+    for sym in C.syms:
+        c, u, rin, R = sym['c'], sym['u'], sym['rin'], sym['R']
+        u_c = -u
+        sw = C.sw
+        # ---- control line: skeleton pixel nearest to the attachment point
+        a0 = c + u_c * (rin + sw + 2)
+        best = None; bd = 1e9
+        r = int(sw + 6)
+        for y in range(int(a0[1]) - r, int(a0[1]) + r + 1):
+            for x in range(int(a0[0]) - r, int(a0[0]) + r + 1):
+                if 0 <= x < C.W and 0 <= y < C.H and G.pix_edge[y, x] >= 0:
+                    dd = (x - a0[0]) ** 2 + (y - a0[1]) ** 2
+                    if dd < bd:
+                        bd = dd; best = (x, y)
+        if best is None:
+            DBG.append((tuple(c), 'no_ctrl_start')); continue
+        eid = G.pix_edge[best[1], best[0]]; k = G.pix_idx[best[1], best[0]]
+        pix = G.edges[eid]['pix']
+        # choose direction away from the circle
+        pa = np.array(pix[max(0, k - 5)], float); pb = np.array(pix[min(len(pix) - 1, k + 5)], float)
+        dirn = 1 if np.linalg.norm(pb - c) > np.linalg.norm(pa - c) else -1
+        rs = trace_search(C, eid, k, dirn)
+        rs = [x for x in rs if not x[4]] or rs
+        if not rs:
+            DBG.append((tuple(c), 'no_ctrl_entity', best)); continue
+        _, cpath, ctrl, cport, _ = rs[0]
+        # ---- junction on the reaction line
+        J0 = sym['J0']
+        best = None; bd = 1e9
+        r = int(sw + 5)
+        for y in range(int(J0[1]) - r, int(J0[1]) + r + 1):
+            for x in range(int(J0[0]) - r, int(J0[0]) + r + 1):
+                if 0 <= x < C.W and 0 <= y < C.H and C.sk[y, x] and (G.pix_edge[y, x] >= 0 or G.root[G.nodelab[y, x]] > 0):
+                    if (x - c[0]) ** 2 + (y - c[1]) ** 2 < (rin + sw * 0.5) ** 2:
+                        continue
+                    dd = (x - J0[0]) ** 2 + (y - J0[1]) ** 2
+                    if dd < bd:
+                        bd = dd; best = (x, y)
+        if best is None:
+            DBG.append((tuple(c), 'no_js')); continue
+        J = np.array(best, float)
+        # ---- arms from J
+        arms = []
+        eid = G.pix_edge[best[1], best[0]]
+        if eid >= 0:
+            k = G.pix_idx[best[1], best[0]]
+            arms = [(eid, k, 1), (eid, k, -1)]
+        else:
+            # J on a node: every edge at that node
+            nl = G.nodelab[best[1], best[0]]
+            node = G.root[nl]
+            for (e2, s2) in G.madj[node]:
+                pts = G.edges[e2]['pix']
+                arms.append((e2, 0 if s2 == 0 else len(pts) - 1, 1 if s2 == 0 else -1))
+        inputs, outputs = [], []
+        usedent = {id(ctrl)}
+        for (e2, k2, dn) in arms:
+            rs = trace_search(C, e2, k2, dn, exclude=usedent)
+            if not rs:
+                DBG.append((tuple(c), 'arm_noent', G.edges[e2]['pix'][k2], ''))
+                continue
+            _, p, ent, port, head = rs[0]
+            usedent.add(id(ent))
+            pl = poly([J] + p[1:] + [port])
+            pl[0] = J; pl[-1] = port
+            item = {'box': [float(v) for v in ent.box], 'path': [[float(a), float(b)] for a, b in pl]}
+            if head:
+                outputs.append(item)
+            else:
+                item['path'] = item['path'][::-1]
+                inputs.append(item)
+        if not outputs:
+            DBG.append((tuple(c), 'no_outputs', len(arms), len(inputs))); continue
+        cp = poly([cport] + cpath[::-1] + [J])
+        cp[0] = cport; cp[-1] = J
+        out.append({'controller': [float(v) for v in ctrl.box], 'control': sym['type'], 'junction': [float(J[0]), float(J[1])],
+                    'control_path': [[float(a), float(b)] for a, b in cp], 'inputs': inputs, 'outputs': outputs})
+    return out
+
+
+# ===================================================================================== cnn
+
+
+def set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+
+class SymNet(nn.Module):
+    def __init__(self, cin=2, ncls=1, w=32):
+        super().__init__()
+        def blk(a, b):
+            return nn.Sequential(nn.Conv2d(a, b, 3, padding=1), nn.BatchNorm2d(b), nn.ReLU(inplace=True),
+                                 nn.Conv2d(b, b, 3, padding=1), nn.BatchNorm2d(b), nn.ReLU(inplace=True))
+        self.b1 = blk(cin, w); self.b2 = blk(w, 2 * w); self.b3 = blk(2 * w, 4 * w)
+        self.head = nn.Sequential(nn.Linear(4 * w * 2, 64), nn.ReLU(inplace=True), nn.Dropout(0.2), nn.Linear(64, ncls))
+
+    def forward(self, x):
+        x = self.b1(x); x = F.max_pool2d(x, 2)
+        x = self.b2(x); x = F.max_pool2d(x, 2)
+        x = self.b3(x)
+        x = torch.cat([x.mean((2, 3)), x.amax((2, 3))], 1)
+        return self.head(x)
+
+
+def dihedral(x, k):
+    if k >= 4:
+        x = torch.flip(x, dims=[3])
+    return torch.rot90(x, k % 4, dims=[2, 3])
+
+
+def train_net(X, y, device, epochs=20, bs=128, lr=2e-3, seed=0, ncls=1):
+    set_seed(seed)
+    net = SymNet(cin=X.shape[1], ncls=ncls).to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    n = len(X)
+    steps = epochs * max(1, (n + bs - 1) // bs)
+    sch = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps, pct_start=0.15)
+    Xt = torch.from_numpy(X).to(device); yt = torch.from_numpy(y.astype(np.float32 if ncls == 1 else np.int64)).to(device)
+    if ncls == 1:
+        pos = float(y.sum()); neg = float(n - y.sum())
+        pw = torch.tensor([min(10.0, neg / max(1.0, pos))], device=device)
+    g = torch.Generator(device='cpu'); g.manual_seed(seed)
+    net.train()
+    for ep in range(epochs):
+        perm = torch.randperm(n, generator=g)
+        for i in range(0, n, bs):
+            idx = perm[i:i + bs].to(device)
+            xb = Xt[idx]; yb = yt[idx]
+            k = int(torch.randint(0, 8, (1,), generator=g))
+            xb = dihedral(xb, k)
+            out = net(xb)
+            if ncls == 1:
+                loss = F.binary_cross_entropy_with_logits(out[:, 0], yb, pos_weight=pw)
+            else:
+                loss = F.cross_entropy(out, yb)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step(); sch.step()
+    net.eval()
+    return net
+
+
+@torch.no_grad()
+def predict_net(net, X, device, bs=512, tta=True):
+    Xt = torch.from_numpy(X).to(device)
+    outs = []
+    for i in range(0, len(X), bs):
+        xb = Xt[i:i + bs]
+        ks = range(8) if tta else [0]
+        p = sum(torch.sigmoid(net(dihedral(xb, k))[:, 0]) for k in ks) / len(ks)
+        outs.append(p.cpu().numpy())
+    return np.concatenate(outs) if outs else np.zeros(0, np.float32)
+
+
+# ===================================================================================== metric
+
+def resample(p):
+    p = np.asarray(p, float)
+    seg = np.hypot(*np.diff(p, axis=0).T)
+    L = seg.sum()
+    n = int(math.ceil(L / 3.0)) + 1
+    cum = np.concatenate([[0], np.cumsum(seg)])
+    t = np.linspace(0, L, n)
+    x = np.interp(t, cum, p[:, 0]); y = np.interp(t, cum, p[:, 1])
+    return np.stack([x, y], 1)
+
+def lcs_match(a, b, tol=6.0):
+    n, m = len(a), len(b)
+    M = (np.hypot(a[:, None, 0] - b[None, :, 0], a[:, None, 1] - b[None, :, 1]) <= tol)
+    prev = np.zeros(m + 1, np.int32)
+    for i in range(n):
+        cur = np.zeros(m + 1, np.int32)
+        row = M[i]
+        for j in range(m):
+            if row[j]:
+                cur[j + 1] = prev[j] + 1
+            else:
+                cur[j + 1] = cur[j] if cur[j] > prev[j + 1] else prev[j + 1]
+        prev = cur
+    return int(prev[m])
+
+def lcs_match_fast(a, b, tol=6.0):
+    # vectorised along anti-diagonals is complex; use row loop with numpy maximum.accumulate trick
+    n, m = len(a), len(b)
+    M = (np.hypot(a[:, None, 0] - b[None, :, 0], a[:, None, 1] - b[None, :, 1]) <= tol)
+    prev = np.zeros(m + 1, np.int32)
+    for i in range(n):
+        diag = np.where(M[i], prev[:-1] + 1, 0)
+        cand = np.maximum(prev[1:], diag)
+        cur = np.concatenate([[0], np.maximum.accumulate(cand)])
+        prev = cur
+    return int(prev[m])
+
+def path_quality(pp, rp):
+    pp = np.asarray(pp, float); rp = np.asarray(rp, float)
+    if np.hypot(*(pp[0] - rp[0])) > 6 or np.hypot(*(pp[-1] - rp[-1])) > 6:
+        return 0.0
+    a = resample(pp); b = resample(rp)
+    h = lcs_match_fast(a, b)
+    return 2.0 * h / (len(a) + len(b))
+
+def iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / u if u > 0 else 0.0
+
+def match_parts(P, R, J, side):
+    if not P or not R:
+        return 0.0
+    C = np.zeros((len(P), len(R)))
+    for i, p in enumerate(P):
+        jp = p['path'][-1] if side == 'in' else p['path'][0]
+        if math.hypot(jp[0] - J[0], jp[1] - J[1]) > 6:
+            continue
+        for k, r in enumerate(R):
+            if iou(p['box'], r['box']) >= 0.5:
+                C[i, k] = path_quality(p['path'], r['path'])
+    ri, ci = linear_sum_assignment(-C)
+    return float(C[ri, ci].sum())
+
+def binding_credit(pb, rb):
+    if pb['control'] != rb['control']:
+        return 0.0
+    if iou(pb['controller'], rb['controller']) < 0.5:
+        return 0.0
+    J = pb['junction']
+    if math.hypot(J[0] - rb['junction'][0], J[1] - rb['junction'][1]) > 6:
+        return 0.0
+    w = 0.0
+    cp = pb['control_path']
+    if math.hypot(cp[-1][0] - J[0], cp[-1][1] - J[1]) <= 6:
+        w += path_quality(cp, rb['control_path'])
+    w += match_parts(pb['inputs'], rb['inputs'], J, 'in')
+    w += match_parts(pb['outputs'], rb['outputs'], J, 'out')
+    p = len(pb['inputs']) + len(pb['outputs']); g = len(rb['inputs']) + len(rb['outputs'])
+    return 2.0 * w / (2 + p + g)
+
+def diagram_score(pred, ref, detail=False):
+    if len(pred) + len(ref) == 0:
+        return 1.0
+    if not pred or not ref:
+        return (0.0, None) if detail else 0.0
+    C = np.zeros((len(pred), len(ref)))
+    for i, pb in enumerate(pred):
+        for k, rb in enumerate(ref):
+            C[i, k] = binding_credit(pb, rb)
+    ri, ci = linear_sum_assignment(-C)
+    s = 2.0 * C[ri, ci].sum() / (len(pred) + len(ref))
+    return (s, C) if detail else s
+
+def score(preds, refs):
+    """preds, refs: dict diagram_id/id -> list of bindings"""
+    ss = [diagram_score(preds.get(k, []), refs[k]) for k in refs]
+    return float(np.mean(ss)), ss
+
+
+
+# =====================================================================================  output hygiene
+def _clip_pt(p, W, H):
+    return [float(min(max(p[0], 0.0), W - 1.0)), float(min(max(p[1], 0.0), H - 1.0))]
+
+
+def _clean_path(path, W, H):
+    pts = [_clip_pt(p, W, H) for p in path]
+    out = [pts[0]]
+    for p in pts[1:]:
+        if abs(p[0] - out[-1][0]) > 1e-6 or abs(p[1] - out[-1][1]) > 1e-6:
+            out.append(p)
+    if len(out) < 2:
+        return None
+    if len(out) > 1024:
+        idx = np.linspace(0, len(out) - 1, 1024).round().astype(int)
+        out = [out[i] for i in idx]
+    L = sum(math.hypot(out[i + 1][0] - out[i][0], out[i + 1][1] - out[i][1]) for i in range(len(out) - 1))
+    if L <= 0 or L > 12000:
+        return None
+    return out
+
+
+def _clean_box(b, W, H):
+    x0, y0, x1, y1 = [float(v) for v in b]
+    x0 = min(max(x0, 0.0), W - 2.0); y0 = min(max(y0, 0.0), H - 2.0)
+    x1 = min(max(x1, x0 + 1.0), W - 1.0); y1 = min(max(y1, y0 + 1.0), H - 1.0)
+    return [x0, y0, x1, y1]
+
+
+def clean_bindings(B, W, H):
+    out = []; seen = set()
+    for b in B:
+        vals = np.array(list(b['controller']) + list(b['junction']), float)
+        if not np.all(np.isfinite(vals)):
+            continue
+        cp = _clean_path(b['control_path'], W, H)
+        if cp is None:
+            continue
+        nb = {'controller': _clean_box(b['controller'], W, H), 'control': b['control'],
+              'junction': _clip_pt(b['junction'], W, H), 'control_path': cp, 'inputs': [], 'outputs': []}
+        for side in ('inputs', 'outputs'):
+            boxes = set()
+            for q in b[side][:64]:
+                if not np.all(np.isfinite(np.array(q['box'], float))):
+                    continue
+                bx = _clean_box(q['box'], W, H)
+                key = tuple(round(v, 3) for v in bx)
+                if key in boxes:
+                    continue
+                pp = _clean_path(q['path'], W, H)
+                if pp is None:
+                    continue
+                boxes.add(key)
+                nb[side].append({'box': bx, 'path': pp})
+        key = json.dumps(nb, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(nb)
+    return out[:256]
+
+
+# =====================================================================================  data + main
+OUT_PATH = '/working/submission.csv'
+DATA = None
+META = None
+
+
+def find_data_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [here, os.getcwd(), '/working', '/working/public', '/working/data', '/data', '/kaggle/input']
+    for r in roots:
+        if os.path.isfile(os.path.join(r, 'test.csv')) and os.path.isfile(os.path.join(r, 'diagrams.jsonl')):
+            return r
+    for r in ['/working', '/kaggle/input', here, os.getcwd()]:
+        for h in sorted(glob.glob(os.path.join(r, '**', 'diagrams.jsonl'), recursive=True)):
+            dd = os.path.dirname(h)
+            if os.path.isfile(os.path.join(dd, 'test.csv')):
+                return dd
+    raise FileNotFoundError('data directory with test.csv and diagrams.jsonl not found')
+
+
+def load_img_path(did):
+    m = META[did]
+    img = cv2.imread(os.path.join(DATA, m['image_path']), cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(m['image_path'])
+    return img
+
+
+def _cands_job(args):
+    """stage 1 for one diagram: candidate symbols, normalised crops, labels (labelled diagrams only)"""
+    did, bindings = args
+    img = load_img_path(did)
+    B = prep_base(img)
+    cl, crops = circle_candidates(B, use_rings=True)
+    lab = np.zeros(len(cl), np.int64)
+    if bindings is not None:
+        ref = [b for b in bindings if b['control'] == 'catalysis']
+        for k, (x, y, rin) in enumerate(cl):
+            for b in ref:
+                if math.hypot(b['junction'][0] - x, b['junction'][1] - y) <= rin + 1.5 * B.sw + 7:
+                    lab[k] = 1; break
+    return did, cl, crops, lab
+
+
+def _final_job(args):
+    """stage 2 for one diagram: accepted symbols -> traced bindings at each threshold"""
+    did, cl, p, thrs = args
+    img = load_img_path(did)
+    H, W = img.shape[:2]
+    B = prep_base(img)
+    outs = []
+    for t in thrs:
+        acc = [c for c, pp in zip(cl, p) if pp >= t]
+        C = prep_finish(B, acc)
+        outs.append(clean_bindings(predict_image(None, C), W, H))
+    return did, outs
+
+
+def write_csv(rows, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['id', 'bindings'])
+        for rid, B in rows:
+            w.writerow([rid, json.dumps(B, separators=(',', ':'))])
+
+
+def main():
+    global DATA, META
+    set_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DATA = find_data_dir()
+    META = {}
+    with open(os.path.join(DATA, 'diagrams.jsonl')) as f:
+        for line in f:
+            if line.strip():
+                r = json.loads(line); META[r['diagram_id']] = r
+    test = pd.read_csv(os.path.join(DATA, 'test.csv'))
+    write_csv([(rid, []) for rid in test['id']], OUT_PATH)  # valid fallback first
+    print('data', DATA, 'device', device, 'test rows', len(test), flush=True)
+    tr = pd.read_csv(os.path.join(DATA, 'train.csv'))
+    va = pd.read_csv(os.path.join(DATA, 'validation.csv'))
+    jobs = [(r.diagram_id, json.loads(r.bindings)) for r in tr.itertuples()] + \
+           [(r.diagram_id, json.loads(r.bindings)) for r in va.itertuples()] + \
+           [(did, None) for did in test['diagram_id']]
+    with Pool(N_PROC) as pool:
+        cres = {r[0]: r for r in pool.map(_cands_job, jobs)}
+    def stack(ids):
+        X = np.concatenate([cres[i][2] for i in ids if len(cres[i][2])], 0)
+        y = np.concatenate([cres[i][3] for i in ids if len(cres[i][3])], 0)
+        return X, y
+    tr_ids = list(tr['diagram_id']); va_ids = list(va['diagram_id'])
+    # ---- held-out selection: fit on train diagrams, choose the symbol threshold on validation diagrams
+    X, y = stack(tr_ids)
+    print('symbol candidates train', len(X), 'positives', int(y.sum()), flush=True)
+    net = train_net(X, y, device, epochs=EPOCHS, seed=SEED)
+    jobs = [(i, cres[i][1], predict_net(net, cres[i][2], device) if len(cres[i][2]) else np.zeros(0), THRS) for i in va_ids]
+    with Pool(N_PROC) as pool:
+        vres = dict(pool.map(_final_job, jobs))
+    vref = {r.diagram_id: json.loads(r.bindings) for r in va.itertuples()}
+    vs = [float(np.mean([diagram_score(vres[i][k], vref[i]) for i in va_ids])) for k in range(len(THRS))]
+    for t, s in zip(THRS, vs):
+        print('validation diagrams %d  threshold %.2f  score %.4f' % (len(va_ids), t, s), flush=True)
+    kbest = int(np.argmax(vs))
+    thr = THRS[kbest]
+    print('selected threshold', thr, flush=True)
+    # ---- final model on all labelled diagrams
+    X, y = stack(tr_ids + va_ids)
+    net = train_net(X, y, device, epochs=EPOCHS, seed=SEED)
+    tids = list(test['diagram_id'])
+    probs = {i: (predict_net(net, cres[i][2], device) if len(cres[i][2]) else np.zeros(0)) for i in tids}
+    nonfinite = int(sum((~np.isfinite(p)).sum() for p in probs.values()))
+    print('non-finite symbol probabilities', nonfinite, flush=True)
+    if nonfinite:
+        raise SystemExit('non-finite model output')
+    jobs = [(i, cres[i][1], probs[i], [thr]) for i in tids]
+    with Pool(N_PROC) as pool:
+        tres = dict(pool.map(_final_job, jobs))
+    rows = [(rid, tres[did][0]) for rid, did in zip(test['id'], test['diagram_id'])]
+    write_csv(rows, OUT_PATH)
+    print('wrote', OUT_PATH, 'rows', len(rows), 'bindings', sum(len(b) for _, b in rows), flush=True)
+
+
+if __name__ == '__main__':
+    main()
