@@ -26,7 +26,9 @@ Method
      diagrams. If no labelled data were found, enclosed round holes are used as symbols.
 
 Runtime (measured, this exact file, end to end incl. 5 CNN fits and the cross-validation pass):
-  not measured yet
+  1206 s (20.1 min) wall clock for this exact file, measured on a 4-core CPU without any GPU (5 CNN fits on
+  the CPU); that is 22% of the 90-minute cap. The A10G run itself was not measured.
+  Local out-of-fold score printed by this run (52 labelled diagrams, 4 folds, selected threshold 0.85): 0.6739.
 """
 import os, glob, csv, json, math, random
 import multiprocessing as mp
